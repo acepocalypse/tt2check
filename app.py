@@ -27,7 +27,7 @@ app = FastAPI(
 # allow any origin (adjust if you want tighter security)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000", "https://topthrillcheck.netlify.app"],
     allow_methods=["GET"],
     allow_headers=["*"],
 )
