@@ -1,0 +1,13 @@
+# --- core video & math ---
+opencv-python-headless>=4.11
+numpy>=1.26
+
+# --- HLS proxy ---
+streamlink>=6.5.0
+
+# --- REST API ---
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+
+# --- optional (tiny) ---
+python-multipart>=0.0.9
