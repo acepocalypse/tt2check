@@ -24,7 +24,6 @@ app = FastAPI(
     description="Serves launch / rollback history collected by detector.py"
 )
 
-# allow any origin (adjust if you want tighter security)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "https://topthrillcheck.netlify.app"],
@@ -42,6 +41,18 @@ def row_to_dict(row, cursor):
     return {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
 
 # ───────── endpoints ─────────
+@app.get("/")
+def landing():
+    return {
+        "message": "Welcome to the Top Thrill 2 Launch API!",
+        "endpoints": {
+            "/latest": "Get the most recent event",
+            "/events": "Get the last N events (default 100, max 1000)",
+            "/stats": "Get the count of each outcome",
+            "/healthz": "Check API health status"
+        }
+    }
+
 @app.get("/latest")
 def latest():
     with contextlib.closing(db_conn()) as conn:
