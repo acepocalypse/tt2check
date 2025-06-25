@@ -1,133 +1,148 @@
-import cv2, time, sqlite3, pathlib, enum
+"""
+detector.py
+────────────────────────────────────────
+Live Top Thrill 2 watcher – no Streamlink required
+• connects to the Pixelcaster HLS feed (tries several hosts)
+• runs the same FSM you just tuned
+• logs SUCCESS / ROLLBACK / INCOMPLETE to SQLite (events.db)
+"""
+
+import cv2, time, enum, sqlite3, pathlib
 from collections import deque
-from datetime import datetime
 
-# ── STREAM URLs ───────────────────────────────────────────────────────────────
-M3U8_HTTPS = "https://cs4.pixelcaster.com/live/cedar2.stream/playlist.m3u8"
-M3U8_HTTP  = "http://cs4.pixelcaster.com/live/cedar2.stream/playlist.m3u8"
+# ───────── stream hosts ─────────
+HOSTS = [
+    "https://cs4.pixelcaster.com/live/cedar2.stream/playlist.m3u8",
+    "https://cs3.pixelcaster.com/live/cedar2.stream/playlist.m3u8",
+    "https://cs2.pixelcaster.com/live/cedar2.stream/playlist.m3u8",
+    "http://cs4.pixelcaster.com/live/cedar2.stream/playlist.m3u8",
+    "http://cs3.pixelcaster.com/live/cedar2.stream/playlist.m3u8",
+    "http://cs2.pixelcaster.com/live/cedar2.stream/playlist.m3u8",
+]
 
-# ── YOUR ROIs (x, y, w, h) ────────────────────────────────────────────────────
-ROI_BOT = (577, 773, 92, 107)   # bottom band
-ROI_MID = (660, 499, 33, 101)   # mid-tower band
-ROI_TOP = (507, 113, 47, 82)    # crest band
-
-# ── DETECTION THRESHOLDS ──────────────────────────────────────────────────────
-MOTION_ENTER = 1000     # pixel-count to say “train present”
-MOTION_EXIT  = 200
-CLASSIFY_MS  = 8000     # <8 s up-motion on tower ⇒ natural rollback
-WAIT_TIMEOUT = 10       # give backward launch ≤10 s to re-appear
-
-DB_PATH = pathlib.Path("events.db")
-
-# ── STATE MACHINE ENUM ────────────────────────────────────────────────────────
-class S(enum.Enum):
-    IDLE = 0; ASC1 = 1; RBACK = 2; WAIT = 3; ASC3 = 4
-
-# ── STREAM HELPERS ────────────────────────────────────────────────────────────
-def open_stream() -> cv2.VideoCapture:
-    """Force FFmpeg backend; try HTTPS first, then HTTP."""
-    for url in (M3U8_HTTPS, M3U8_HTTP):
+def open_stream():
+    for url in HOSTS:
         cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
         if cap.isOpened():
-            print(f"[stream] connected via {url.split(':')[0].upper()}")
+            print(f"[stream] connected → {url}")
             return cap
         cap.release()
-    raise RuntimeError("Could not open HLS stream with FFmpeg backend")
+    raise RuntimeError("all host attempts failed")
 
-def ensure_table(conn):
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS launches (
-            id INTEGER PRIMARY KEY,
-            ts_utc  TEXT,
-            outcome TEXT  -- success | rollback | incomplete
-        );
-    """)
+# ───────── ROIs (x, y, w, h) ─────────
+ROI_BOT = (608, 761, 55, 97)   # bottom band
+ROI_MID = (674, 234,  8,189)   # mid-tower band
+ROI_TOP = (505, 429, 22,109)   # descent side of crest
 
-def log_event(conn, outcome):
-    conn.execute(
-        "INSERT INTO launches(ts_utc, outcome) VALUES (?,?)",
-        (datetime.utcnow().isoformat(timespec="seconds"), outcome)
-    )
+# ───────── thresholds ─────────
+MOTION_ENTER = 350
+MOTION_EXIT  = 350
+TOP_ENTER    = 300
+UP,  DOWN    = -0.5, 0.5        # px/frame
+WAIT_TIMEOUT = 30
+
+# ───────── SQLite setup ───────
+DB_PATH = pathlib.Path("events.db")
+conn = sqlite3.connect(DB_PATH)
+conn.execute("""CREATE TABLE IF NOT EXISTS launches (
+                  id INTEGER PRIMARY KEY,
+                  ts_utc TEXT,
+                  outcome TEXT )""")
+def log_event(outcome:str):
+    conn.execute("INSERT INTO launches(ts_utc,outcome) VALUES (datetime('now'),?)",
+                 (outcome,))
     conn.commit()
-    print(f"[event] {outcome} @ {datetime.now().strftime('%H:%M:%S')}")
+    print(f"\n[event] {outcome.upper()} logged")
 
-def in_roi(cy, roi):
-    return roi[1] <= cy <= roi[1] + roi[3]
+# ───────── FSM & helpers ───────
+class S(enum.Enum):
+    IDLE=0; ASC1=1; RBACK=2; WAIT=3; ASC3=4
 
-# ── MAIN LOOP ─────────────────────────────────────────────────────────────────
-def main():
-    cap   = open_stream()
-    bg    = None                          # adaptive background for ROI_BOT
-    state = S.IDLE
-    hist  = deque(maxlen=2)               # store last two (cy, t) pairs
-    t_wait = None
+C = {S.IDLE:"\033[37m",S.ASC1:"\033[32m",S.RBACK:"\033[33m",
+     S.WAIT:"\033[36m",S.ASC3:"\033[35m","END":"\033[0m"}
 
-    conn = sqlite3.connect(DB_PATH)
-    ensure_table(conn)
+def centroid(mask):
+    cnts,_=cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts: return None
+    c=max(cnts,key=cv2.contourArea)
+    if cv2.contourArea(c)<40: return None
+    m=cv2.moments(c)
+    return int(m["m01"]/m["m00"]) if m["m00"] else None
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            print("[stream] dropped – reconnecting in 2 s…")
-            time.sleep(2)
-            cap.release()
-            cap = open_stream()
-            continue
+# ───────── main loop ───────────
+cap   = open_stream()
+state = S.IDLE
+hist  = deque(maxlen=3)
+bg_bot = bg_top = None
+t0 = None
 
-        # ── 1️⃣  Crop bottom ROI and measure motion ─────────────
-        x,y,w,h = ROI_BOT
-        roi = frame[y:y+h, x:x+w]
+while True:
+    ok, frame = cap.read()
+    if not ok:
+        print("\n[stream] lost – reconnecting…")
+        time.sleep(1)
+        cap.release()
+        cap   = open_stream()
+        bg_bot = bg_top = None
+        state = S.IDLE
+        hist.clear()
+        continue
 
-        if bg is None:
-            bg = roi.astype("float32")
-            continue
+    # ---------- ROI crops ----------
+    xb,yb,wb,hb = ROI_BOT
+    bot = frame[yb:yb+hb, xb:xb+wb]
+    xt,yt,wt,ht = ROI_TOP
+    top = frame[yt:yt+ht, xt:xt+wt]
 
-        diff    = cv2.absdiff(roi, bg.astype("uint8"))
-        motion  = (diff > 25).sum()
+    # ---------- BG init ----------
+    if bg_bot is None:
+        bg_bot = bot.astype("float32")
+        bg_top = top.astype("float32")
+        continue
 
-        # crude vertical centroid in ROI_BOT
-        gray   = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        _, binmask = cv2.threshold(gray, 30, 255, cv2.THRESH_BINARY)
-        m      = cv2.moments(binmask)
-        cy     = y + int(m['m01']/m['m00']) if m['m00'] else None
+    # ---------- bottom ROI ----------
+    diff_bot   = cv2.absdiff(bot, bg_bot.astype("uint8"))
+    motion_bot = (diff_bot > 25).sum()
+    cv2.accumulateWeighted(bot.astype("float32"), bg_bot, 0.001)
 
-        # velocity (down=+, up=–) in pixels/frame
-        if cy is not None:
-            hist.append((cy, time.time()))
-        v = (hist[-1][0] - hist[-2][0]) if len(hist) >= 2 else 0
-        now = time.time()
+    gray_bot = cv2.cvtColor(diff_bot, cv2.COLOR_BGR2GRAY)
+    _, msk   = cv2.threshold(gray_bot, 40, 255, cv2.THRESH_BINARY)
+    cy_loc   = centroid(msk)                   # 0..hb-1 or None
+    cy_abs   = yb + cy_loc if cy_loc is not None else None
 
-        # ── 2️⃣  FINITE-STATE MACHINE ──────────────────────────
-        if state == S.IDLE and motion > MOTION_ENTER and v < -5:
-            state = S.ASC1
+    hist.append(cy_loc if cy_loc is not None else hist[-1] if hist else None)
+    v = (hist[-1]-hist[0])/2 if len(hist)>=3 and None not in hist else 0
 
-        elif state == S.ASC1 and v > 5 and cy and in_roi(cy, ROI_BOT):
-            state = S.RBACK
+    # ---------- crest ROI motion ----------
+    diff_top   = cv2.absdiff(top, bg_top.astype("uint8"))
+    motion_top = (diff_top > 25).sum()
+    cv2.accumulateWeighted(top.astype("float32"), bg_top, 0.001)
 
-        elif state == S.RBACK and motion < MOTION_EXIT:
-            state, t_wait = S.WAIT, now
+    # ---------- live console ----------
+    print(f"\r{C[state]}{state.name:<5}{C['END']} "
+          f"bot={motion_bot:<4} top={motion_top:<4} v={v:+4.1f}", end="")
 
-        elif state == S.WAIT and motion > MOTION_ENTER and v < -5:
-            state = S.ASC3
+    # ---------- FSM ----------
+    if state==S.IDLE and motion_bot>MOTION_ENTER and v<UP:
+        state=S.ASC1
 
-        elif state == S.WAIT and now - t_wait > WAIT_TIMEOUT:
-            log_event(conn, "incomplete")
-            state = S.IDLE
+    elif state==S.ASC1 and v>DOWN and cy_loc is not None:
+        state=S.RBACK
 
-        elif state == S.ASC3 and cy and in_roi(cy, ROI_TOP):
-            log_event(conn, "success")
-            state = S.IDLE
+    elif state==S.RBACK and (motion_bot<MOTION_EXIT or cy_loc is None):
+        state,t0=S.WAIT,time.time()
 
-        elif (
-            state == S.ASC3
-            and v > 5
-            and cy and cy > ROI_MID[1]
-        ):
-            log_event(conn, "rollback")
-            state = S.IDLE
+    elif state==S.WAIT:
+        if motion_bot>MOTION_EXIT:                     # still falling
+            t0=time.time()
+        elif motion_bot>MOTION_ENTER and v<UP and cy_loc is not None:
+            state=S.ASC3
+        elif time.time()-t0>WAIT_TIMEOUT:
+            log_event("incomplete"); state=S.IDLE
 
-        # ── 3️⃣  Update background slowly to adapt to light ─────
-        cv2.accumulateWeighted(roi.astype("float32"), bg, 0.001)
-
-if __name__ == "__main__":
-    main()
+    elif state==S.ASC3:
+        if motion_top>TOP_ENTER and v>DOWN:
+            log_event("success");  state=S.IDLE
+        elif v>DOWN and cy_abs is not None \
+             and cy_abs > ROI_MID[1]:
+            log_event("rollback"); state=S.IDLE
