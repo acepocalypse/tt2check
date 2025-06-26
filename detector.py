@@ -1,153 +1,202 @@
 #!/usr/bin/env python3
-"""
-detector.py  –  Top Thrill 2 launch detector based on ROI motion from Cedar Point's live stream
-"""
-
-import enum, time, sqlite3, pathlib, sys
+import enum, time, sqlite3, pathlib, cv2, streamlink
 from collections import deque
 
-import cv2
-import numpy as np
-import streamlink
+HOST_URL = "https://cs4.pixelcaster.com/live/cedar2.stream/playlist.m3u8"
 
-# ───────── Config ─────────
-HOST_URL    = "https://cs4.pixelcaster.com/live/cedar2.stream/playlist.m3u8"
-ROI_BOT     = (608, 761, 55, 97)
-ROI_TOP     = (505, 429, 22,109)
+ROI_BOT  = (608, 761, 55, 97)
+ROI_TOP  = (505, 429, 22,115)
 
-ENTER_THR   = 750      # ASC1
-EXIT_THR    = 650     # end rollback
-TOP_THR     = 650     # crest hit
-UP, DOWN    = -0.4, 0.4
-WAIT_TIMEOUT = 45
-MIN_WAIT_TIME = 10 
-MIN_ASC1_TIME = 1
+#!/usr/bin/env python3
+import enum, time, sqlite3, pathlib, cv2, streamlink
+from collections import deque
+
+HOST_URL = "https://cs4.pixelcaster.com/live/cedar2.stream/playlist.m3u8"
+
+ROI_BOT  = (608, 761, 55, 97)
+ROI_TOP  = (505, 429, 22,125)
+
+ENTER_THR, EXIT_THR, TOP_THR = 750, 650, 900
+UP, DOWN = -0.4, 0.4
+WAIT_TIMEOUT, MIN_WAIT_TIME, MIN_ASC1_TIME, COOLDOWN = 45, 10, 1, 60
+ARM_DELAY = 3
 
 DB = pathlib.Path("events.db")
 
-# ───────── SQLite helper ─────────
 def db():
     conn = sqlite3.connect(DB)
-    conn.execute("""CREATE TABLE IF NOT EXISTS launches(
-                      id INTEGER PRIMARY KEY,
-                      ts_utc TEXT,
-                      outcome TEXT)""")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS launches("
+        "id INTEGER PRIMARY KEY, ts REAL, outcome TEXT)"
+    )
     return conn
-def log_event(conn,outcome:str):
-    conn.execute("INSERT INTO launches VALUES(NULL, datetime('now'), ?)",
-                 (outcome,))
-    conn.commit()
-    print(f"\n[event] {outcome.upper()}")
 
-# ───────── open via Streamlink ─────
-def open_stream(url:str)->cv2.VideoCapture:
-    print(f"[stream] resolving {url}")
+def log_event(conn, outcome):
+    ts = time.time()
+    conn.execute("INSERT INTO launches VALUES(NULL, ?, ?)", (ts, outcome))
+    conn.commit()
+    print(f"\n[event] {outcome.upper()} @ {time.strftime('%H:%M:%S', time.localtime(ts))}")
+
+def correct_rollback(conn):
+    conn.execute(
+        "UPDATE launches SET outcome='success' "
+        "WHERE id = (SELECT id FROM launches "
+        "WHERE outcome='rollback' ORDER BY id DESC LIMIT 1)"
+    )
+    conn.commit()
+    print("\n[correction] rollback → success")
+
+def open_stream(url):
     sl_url = streamlink.streams(url)["best"].url
-    cap    = cv2.VideoCapture(sl_url, cv2.CAP_FFMPEG)
+    cap = cv2.VideoCapture(sl_url, cv2.CAP_FFMPEG)
     if not cap.isOpened():
         raise RuntimeError("OpenCV failed to open HLS URL")
-    print("[stream] OpenCV connected")
+    print("[stream] connected")
     return cap
 
-# ───────── centroid helper ─────────
-def centroid(mask)->int|None:
-    cnts,_=cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts: return None
-    c=max(cnts,key=cv2.contourArea)
-    if cv2.contourArea(c)<40: return None
-    m=cv2.moments(c)
-    return int(m["m01"]/m["m00"]) if m["m00"] else None
+def centroid(mask):
+    c, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not c:
+        return None
+    c = max(c, key=cv2.contourArea)
+    if cv2.contourArea(c) < 40:
+        return None
+    m = cv2.moments(c)
+    return int(m["m01"] / m["m00"]) if m["m00"] else None
 
-# ───────── FSM setup ─────────
 class S(enum.Enum):
-    IDLE=0; ASC1=1; RBACK=2; WAIT=3; ASC3=4
-CLR = {S.IDLE:"\033[37m",S.ASC1:"\033[32m",S.RBACK:"\033[33m",
-       S.WAIT:"\033[36m",S.ASC3:"\033[35m","END":"\033[0m"}
+    IDLE = 0
+    ASC1 = 1
+    RBACK = 2
+    WAIT = 3
+    ASC3 = 4
 
 def main(headless=True):
-    conn   = db()
-    cap    = open_stream(HOST_URL)
-    state  = S.IDLE
+    conn = db()
+    cap = open_stream(HOST_URL)
+
+    state = S.IDLE
     bg_bot = bg_top = None
-    hist   = deque(maxlen=3)
-    t0=t_asc1=t_asc3=None
-    logged_this_run = False
+    hist = deque(maxlen=3)
+
+    t0 = t_asc1 = None
+    logged = False
+    last_rb = 0
+    last_bg = 0
+    last_success = 0
+    quiet_t = None
+    top_hi = 0
+    ready_at = time.time() + ARM_DELAY
 
     try:
         while True:
-            ok, f = cap.read()
+            ok, frame = cap.read()
             if not ok:
-                print("\n[warn] frame lost, reconnecting…")
-                cap.release(); time.sleep(3)
-                cap=open_stream(HOST_URL)
-                bg_bot=bg_top=None; state=S.IDLE; hist.clear(); continue
+                cap.release()
+                time.sleep(3)
+                cap = open_stream(HOST_URL)
+                bg_bot = bg_top = None
+                state = S.IDLE
+                hist.clear()
+                ready_at = time.time() + ARM_DELAY
+                continue
 
-            xb,yb,wb,hb = ROI_BOT
-            bot = f[yb:yb+hb, xb:xb+wb]
-            xt,yt,wt,ht = ROI_TOP
-            top = f[yt:yt+ht, xt:xt+wt]
+            now = time.time()
+
+            xb, yb, wb, hb = ROI_BOT
+            bot = frame[yb: yb + hb, xb: xb + wb]
+            xt, yt, wt, ht = ROI_TOP
+            top = frame[yt: yt + ht, xt: xt + wt]
 
             if bg_bot is None:
                 bg_bot, bg_top = bot.astype("float32"), top.astype("float32")
+                last_bg = now
                 continue
 
-            # motion
-            diff_bot = cv2.absdiff(bot,bg_bot.astype("uint8"))
-            motion_bot = (diff_bot>25).sum()
-            diff_top = cv2.absdiff(top,bg_top.astype("uint8"))
-            motion_top = (diff_top>25).sum()
+            diff_bot = cv2.absdiff(bot, bg_bot.astype("uint8"))
+            diff_top = cv2.absdiff(top, bg_top.astype("uint8"))
+            motion_bot = (diff_bot > 25).sum()
+            motion_top = (diff_top > 25).sum()
 
-            if state in (S.IDLE,S.WAIT):
-                cv2.accumulateWeighted(bot.astype("float32"),bg_bot,0.01)
-                cv2.accumulateWeighted(top.astype("float32"),bg_top,0.01)
+            if now - last_bg > 0.5:
+                cv2.accumulateWeighted(bot.astype("float32"), bg_bot, 0.02)
+                cv2.accumulateWeighted(top.astype("float32"), bg_top, 0.02)
+                last_bg = now
 
-            gray=cv2.cvtColor(diff_bot,cv2.COLOR_BGR2GRAY)
-            _,msk=cv2.threshold(gray,40,255,cv2.THRESH_BINARY)
-            cy_loc=centroid(msk)
-            cy=yb+cy_loc if cy_loc is not None else None
-            hist.append(cy_loc if cy_loc is not None else hist[-1] if hist else None)
-            v=(hist[-1]-hist[0])/2 if len(hist)>=3 and None not in hist else 0
+            gray = cv2.cvtColor(diff_bot, cv2.COLOR_BGR2GRAY)
+            _, msk = cv2.threshold(gray, 40, 255, cv2.THRESH_BINARY)
+            cy = centroid(msk)
 
-            print(f"\r{CLR[state]}{state.name:<5}{CLR['END']} "
-                  f"bot={motion_bot:<4} top={motion_top:<4} v={v:+3.1f}",end="")
+            if cy is not None:
+                hist.append((cy, now))
+            elif hist:
+                hist.append((hist[-1][0], now))
+            else:
+                hist.append((None, now))
 
-            if state != S.IDLE and motion_top > TOP_THR and not logged_this_run:
-                log_event(conn, "success")
+            if len(hist) >= 3 and None not in [h[0] for h in hist]:
+                dt = hist[-1][1] - hist[0][1]
+                v = (hist[-1][0] - hist[0][0]) / dt if dt else 0
+            else:
+                v = 0
+
+            # crest / success detector with 2-frame confirmation
+            if state != S.IDLE:
+                top_hi = top_hi + 1 if motion_top > TOP_THR else 0
+                if top_hi >= 2 and not logged and now >= ready_at:
+                    if now - last_success >= COOLDOWN:
+                        if last_rb and now - last_rb < 30:
+                            correct_rollback(conn)
+                        log_event(conn, "success")
+                        last_success = now
+                    state = S.IDLE
+                    logged = True
+                    quiet_t = None
+                    top_hi = 0
+
+            # FSM transitions
+            if state == S.IDLE:
+                if motion_bot > ENTER_THR and v < UP:
+                    state, t_asc1 = S.ASC1, now
+            elif state == S.ASC1 and v > DOWN and now - t_asc1 > MIN_ASC1_TIME:
+                state = S.RBACK
+            elif state == S.RBACK and motion_bot < EXIT_THR:
+                state, t0 = S.WAIT, now
+            elif state == S.WAIT:
+                if motion_bot > ENTER_THR and v < UP and now - t0 > MIN_WAIT_TIME:
+                    state = S.ASC3
+                elif now - t0 > WAIT_TIMEOUT and now >= ready_at:
+                    log_event(conn, "incomplete")
+                    state = S.IDLE
+                    logged = True
+            elif state == S.ASC3 and v > DOWN and now >= ready_at:
+                log_event(conn, "rollback")
                 state = S.IDLE
-                logged_this_run = False
-                continue
+                logged = True
+                last_rb = now
 
-            if state==S.IDLE:
-                logged_this_run = False
-                if motion_bot>ENTER_THR and v<UP:
-                    state=S.ASC1; t_asc1=time.time()
-            elif state==S.ASC1 and v>DOWN and cy_loc is not None and time.time()-t_asc1>MIN_ASC1_TIME:
-                state=S.RBACK
-            elif state==S.RBACK and (motion_bot<EXIT_THR or cy_loc is None):
-                state,t0=S.WAIT,time.time()
-            elif state==S.WAIT:
-                if motion_bot>ENTER_THR and v<UP and cy_loc is not None and time.time()-t0>MIN_WAIT_TIME:
-                    state=S.ASC3; t_asc3=time.time()
-                elif time.time()-t0>WAIT_TIMEOUT:
-                    log_event(conn,"incomplete"); state=S.IDLE
-                    logged_this_run = True
-            elif state==S.ASC3:
-                if v>DOWN and cy is not None:
-                    log_event(conn,"rollback"); state=S.IDLE
-                    logged_this_run = True
+            # quiet-time latch
+            if motion_bot < 50 and motion_top < 50:
+                quiet_t = quiet_t or now
+            else:
+                quiet_t = None
+            if quiet_t and now - quiet_t > 5:
+                logged = False
 
-            if not headless:
-                cv2.rectangle(f,(xb,yb),(xb+wb,yb+hb),(0,255,0),1)
-                cv2.rectangle(f,(xt,yt),(xt+wt,yt+ht),(0,0,255),1)
-                cv2.imshow("preview",f)
-                if cv2.waitKey(1)&0xFF==27: break
+            # live ticker
+            print(f"\r{state.name:<5} bot={motion_bot:<5} top={motion_top:<5} v={v:+4.1f}", end="", flush=True)
+
+            if not headless and cv2.waitKey(1) & 0xFF == 27:
+                break
 
     except KeyboardInterrupt:
         pass
     finally:
-        cap.release(); conn.close()
-        if not headless: cv2.destroyAllWindows()
+        cap.release()
+        conn.close()
+        if not headless:
+            cv2.destroyAllWindows()
         print("\n[bye] detector stopped")
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main(headless=True)
