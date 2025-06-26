@@ -15,11 +15,11 @@ HOST_URL    = "https://cs4.pixelcaster.com/live/cedar2.stream/playlist.m3u8"
 ROI_BOT     = (608, 761, 55, 97)
 ROI_TOP     = (505, 429, 22,109)
 
-ENTER_THR   = 900      # ASC1
-EXIT_THR    = 800      # end rollback
-TOP_THR     = 800      # crest hit
-UP, DOWN    = -0.5, 0.5
-WAIT_TIMEOUT = 30
+ENTER_THR   = 750      # ASC1
+EXIT_THR    = 650     # end rollback
+TOP_THR     = 650     # crest hit
+UP, DOWN    = -0.4, 0.4
+WAIT_TIMEOUT = 45
 
 DB = pathlib.Path("events.db")
 
@@ -69,6 +69,7 @@ def main(headless=True):
     bg_bot = bg_top = None
     hist   = deque(maxlen=3)
     t0=t_asc3=None
+    logged_this_run = False  # Track if we've already logged for this run
 
     try:
         while True:
@@ -109,9 +110,18 @@ def main(headless=True):
             print(f"\r{CLR[state]}{state.name:<5}{CLR['END']} "
                   f"bot={motion_bot:<4} top={motion_top:<4} v={v:+3.1f}",end="")
 
+            # Check for TOP ROI hit in any state (except IDLE) - mark as success
+            if state != S.IDLE and motion_top > TOP_THR and not logged_this_run:
+                log_event(conn, "success")
+                state = S.IDLE
+                logged_this_run = False
+                continue
+
             # FSM
-            if state==S.IDLE and motion_bot>ENTER_THR and v<UP:
-                state=S.ASC1
+            if state==S.IDLE:
+                logged_this_run = False
+                if motion_bot>ENTER_THR and v<UP:
+                    state=S.ASC1
             elif state==S.ASC1 and v>DOWN and cy_loc is not None:
                 state=S.RBACK
             elif state==S.RBACK and (motion_bot<EXIT_THR or cy_loc is None):
@@ -121,11 +131,11 @@ def main(headless=True):
                     state=S.ASC3; t_asc3=time.time()
                 elif time.time()-t0>WAIT_TIMEOUT:
                     log_event(conn,"incomplete"); state=S.IDLE
+                    logged_this_run = True
             elif state==S.ASC3:
-                if motion_top>TOP_THR:
-                    log_event(conn,"success");  state=S.IDLE
-                elif v>DOWN and cy is not None:
+                if v>DOWN and cy is not None:
                     log_event(conn,"rollback"); state=S.IDLE
+                    logged_this_run = True
 
             # optional preview
             if not headless:
@@ -142,6 +152,4 @@ def main(headless=True):
         print("\n[bye] detector stopped")
 
 if __name__=="__main__":
-    # set headless=False if you want a preview window
     main(headless=True)
-    
