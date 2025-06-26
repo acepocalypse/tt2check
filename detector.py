@@ -20,6 +20,8 @@ EXIT_THR    = 650     # end rollback
 TOP_THR     = 650     # crest hit
 UP, DOWN    = -0.4, 0.4
 WAIT_TIMEOUT = 45
+MIN_WAIT_TIME = 10 
+MIN_ASC1_TIME = 1
 
 DB = pathlib.Path("events.db")
 
@@ -68,7 +70,7 @@ def main(headless=True):
     state  = S.IDLE
     bg_bot = bg_top = None
     hist   = deque(maxlen=3)
-    t0=t_asc3=None
+    t0=t_asc1=t_asc3=None
     logged_this_run = False
 
     try:
@@ -118,13 +120,13 @@ def main(headless=True):
             if state==S.IDLE:
                 logged_this_run = False
                 if motion_bot>ENTER_THR and v<UP:
-                    state=S.ASC1
-            elif state==S.ASC1 and v>DOWN and cy_loc is not None:
+                    state=S.ASC1; t_asc1=time.time()
+            elif state==S.ASC1 and v>DOWN and cy_loc is not None and time.time()-t_asc1>MIN_ASC1_TIME:
                 state=S.RBACK
             elif state==S.RBACK and (motion_bot<EXIT_THR or cy_loc is None):
                 state,t0=S.WAIT,time.time()
             elif state==S.WAIT:
-                if motion_bot>ENTER_THR and v<UP and cy_loc is not None:
+                if motion_bot>ENTER_THR and v<UP and cy_loc is not None and time.time()-t0>MIN_WAIT_TIME:
                     state=S.ASC3; t_asc3=time.time()
                 elif time.time()-t0>WAIT_TIMEOUT:
                     log_event(conn,"incomplete"); state=S.IDLE
