@@ -9,5 +9,4 @@ streamlink>=6.5.0
 fastapi>=0.111.0
 uvicorn[standard]>=0.29.0
 
-# --- optional (tiny) ---
 python-multipart>=0.0.9

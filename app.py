@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import sqlite3, pathlib, contextlib
 
 # ───────── configuration ─────────
-DB_PATH = pathlib.Path(__file__).with_name("events.db")   # same folder as app.py
+DB_PATH = pathlib.Path(__file__).with_name("events.db") 
 
 app = FastAPI(
     title="Top Thrill 2 Launch API",

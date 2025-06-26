@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-detector.py  –  your “good” Streamlink+OpenCV logic, head-less
+detector.py  –  Top Thrill 2 launch detector based on ROI motion from Cedar Point's live stream
 """
 
 import enum, time, sqlite3, pathlib, sys
@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 import streamlink
 
-# ───────── Config (unchanged ROIs / thresholds) ─────────
+# ───────── Config ─────────
 HOST_URL    = "https://cs4.pixelcaster.com/live/cedar2.stream/playlist.m3u8"
 ROI_BOT     = (608, 761, 55, 97)
 ROI_TOP     = (505, 429, 22,109)
@@ -69,7 +69,7 @@ def main(headless=True):
     bg_bot = bg_top = None
     hist   = deque(maxlen=3)
     t0=t_asc3=None
-    logged_this_run = False  # Track if we've already logged for this run
+    logged_this_run = False
 
     try:
         while True:
@@ -106,18 +106,15 @@ def main(headless=True):
             hist.append(cy_loc if cy_loc is not None else hist[-1] if hist else None)
             v=(hist[-1]-hist[0])/2 if len(hist)>=3 and None not in hist else 0
 
-            # ticker
             print(f"\r{CLR[state]}{state.name:<5}{CLR['END']} "
                   f"bot={motion_bot:<4} top={motion_top:<4} v={v:+3.1f}",end="")
 
-            # Check for TOP ROI hit in any state (except IDLE) - mark as success
             if state != S.IDLE and motion_top > TOP_THR and not logged_this_run:
                 log_event(conn, "success")
                 state = S.IDLE
                 logged_this_run = False
                 continue
 
-            # FSM
             if state==S.IDLE:
                 logged_this_run = False
                 if motion_bot>ENTER_THR and v<UP:
@@ -137,7 +134,6 @@ def main(headless=True):
                     log_event(conn,"rollback"); state=S.IDLE
                     logged_this_run = True
 
-            # optional preview
             if not headless:
                 cv2.rectangle(f,(xb,yb),(xb+wb,yb+hb),(0,255,0),1)
                 cv2.rectangle(f,(xt,yt),(xt+wt,yt+ht),(0,0,255),1)
