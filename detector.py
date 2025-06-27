@@ -34,7 +34,8 @@ SIGMA_BOT, SIGMA_TOP = 6, 4
 ARM_DELAY         = 3
 CREST_HOLD        = 0.40     # s
 VERIFY_WINDOW     = 5.0      # s
-AUTO_SUCCESS      = 30.0     # s after ASC2
+AUTO_SUCCESS      = 17.5     # s after ASC2
+ROLLBACK_CONFIRM_FRAMES = 3  # frames
 UP_FAST, DOWN_FAST= -0.6, 0.6
 LIVE_URL          = "https://cs4.pixelcaster.com/live/cedar2.stream/playlist.m3u8"
 DB_PATH           = pathlib.Path("events.db")
@@ -83,10 +84,11 @@ def detector(src, gui=True):
     armed = False
     virtual = 0.0
     state = S.IDLE
-    hist  = deque(maxlen=3)
+    hist  = deque(maxlen=5)
 
     crest_start = verify_dead = asc2_start = None
     pending_id  = None
+    verify_rollback_hits = 0
 
     while True:
         ok, frame = cap.read()
@@ -128,7 +130,7 @@ def detector(src, gui=True):
         _, mk = cv2.threshold(gray, 40, 255, cv2.THRESH_BINARY)
         cy = centroid(mk)
         hist.append((cy, now) if cy is not None else (hist[-1][0], now) if hist else (None, now))
-        if len(hist) >= 3 and None not in [h[0] for h in hist]:
+        if len(hist) >= 5 and None not in [h[0] for h in hist]:
             dt = hist[-1][1] - hist[0][1]
             v = (hist[-1][0] - hist[0][0]) / dt if dt else 0
         else:
@@ -154,6 +156,7 @@ def detector(src, gui=True):
             pending_id  = log_event(conn, "pending", now)
             verify_dead = now + VERIFY_WINDOW
             state = S.VERIFY
+            verify_rollback_hits = 0
         elif state is S.ASC2 and bot_hot and v > DOWN_FAST:
             log_event(conn, "rollback", now)
             state = S.IDLE; asc2_start = None
@@ -162,6 +165,11 @@ def detector(src, gui=True):
             state = S.IDLE; asc2_start = None
         elif state is S.VERIFY:
             if bot_hot and v > DOWN_FAST:
+                verify_rollback_hits += 1
+            else:
+                verify_rollback_hits = 0
+
+            if verify_rollback_hits >= ROLLBACK_CONFIRM_FRAMES:
                 conn.execute("UPDATE launches SET outcome='rollback' WHERE id=?", (pending_id,))
                 conn.commit()
                 state = S.IDLE
