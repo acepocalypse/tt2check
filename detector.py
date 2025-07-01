@@ -116,6 +116,7 @@ def detector(src, gui=True):
     max_reconnect_attempts=5
 
     while True:
+        now = time.time()
         ok, frame = cap.read()
         if not ok:
             if live: 
