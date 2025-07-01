@@ -113,7 +113,8 @@ def detector(src, gui=True):
     verify_hits=0
     last_queue_update=0; queue_data=None
     reconnect_attempts=0
-    max_reconnect_attempts=5
+    max_reconnect_attempts=10
+    start_time = time.time()
 
     while True:
         now = time.time()
@@ -121,16 +122,28 @@ def detector(src, gui=True):
         if not ok:
             if live: 
                 reconnect_attempts += 1
-                print(f"\nStream disconnected, reconnecting... (attempt {reconnect_attempts}/{max_reconnect_attempts})")
+                backoff_time = min(30, 2 ** reconnect_attempts)  # Exponential backoff, max 30s
+                print(f"\nStream disconnected, reconnecting in {backoff_time}s... (attempt {reconnect_attempts}/{max_reconnect_attempts})")
                 if reconnect_attempts > max_reconnect_attempts:
                     print("Max reconnection attempts reached, exiting")
                     break
-                time.sleep(5)  # Wait longer before reconnecting
+                time.sleep(backoff_time)
                 try:
                     cap.release()
                     cap, live, _ = open_source(src)
-                    reconnect_attempts = 0  # Reset on successful reconnection
-                    print("Reconnected successfully")
+                    reconnect_attempts = 0
+                    # Reset state after reconnection
+                    bg = {k:None for k in ROI}
+                    base = {k:[] for k in ROI}
+                    thr = {k:math.inf for k in ROI}
+                    armed = False
+                    state = S.IDLE
+                    hist.clear()
+                    asc2_start = descent_start = verify_dead = None
+                    descent_seen = False
+                    verify_hits = 0
+                    start_time = time.time()
+                    print("Reconnected successfully, resetting detector state")
                 except Exception as e:
                     print(f"Reconnection failed: {e}")
                 continue
@@ -139,6 +152,9 @@ def detector(src, gui=True):
         # Reset reconnect counter on successful frame read
         if live and reconnect_attempts > 0:
             reconnect_attempts = 0
+
+        # Use relative time for better handling after reconnections
+        relative_time = now - start_time
 
         # queue API
         if live and now-last_queue_update>=QUEUE_UPDATE_INTERVAL:
@@ -157,7 +173,7 @@ def detector(src, gui=True):
             if len(base[k])<BASE_FRAMES: base[k].append(mot[k])
 
         # thresholds
-        if not armed and all(len(v)>=BASE_FRAMES for v in base.values()) and now>=ARM_DELAY:
+        if not armed and all(len(v)>=BASE_FRAMES for v in base.values()) and relative_time>=ARM_DELAY:
             for k in ROI:
                 m=sum(base[k])/len(base[k])
                 s=(sum((v-m)**2 for v in base[k])/len(base[k]))**0.5
@@ -233,7 +249,7 @@ def detector(src, gui=True):
             if cv2.waitKey(1)&0xFF==27: break
 
         print(f"\r{state.name:<8} B={'Y'if bot_hot else'-'} T={'Y'if top_hot else'-'} V={'Y'if ver_hot else'-'} "
-              f"v={v:5.2f} {'GR' if in_grace else '  '} t={now:7.2f}",end='')
+              f"v={v:5.2f} {'GR' if in_grace else '  '} t={relative_time:7.2f}",end='')
 
     cap.release(); conn.close()
     if gui: cv2.destroyAllWindows(); print("\n[bye]")
