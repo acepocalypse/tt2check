@@ -32,6 +32,7 @@ ROLLBACK_VELOCITY_THRESHOLD = 1.5
 VERIFY_ROLLBACK_VELOCITY = 2.0
 UP_FAST, DOWN_FAST = -0.6, 0.6
 VELOCITY_SMOOTHING = 7
+RECONNECT_GRACE_PERIOD = 20.0
 LIVE_URL = "https://cs4.pixelcaster.com/live/cedar2.stream/playlist.m3u8"
 
 QUEUE_TIMES_URL   = "https://queue-times.com/parks/50/queue_times.json"
@@ -115,6 +116,7 @@ def detector(src, gui=True):
     reconnect_attempts=0
     max_reconnect_attempts=10
     start_time = time.time()
+    last_reconnect_time = None
 
     while True:
         now = time.time()
@@ -132,6 +134,7 @@ def detector(src, gui=True):
                     cap.release()
                     cap, live, _ = open_source(src)
                     reconnect_attempts = 0
+                    last_reconnect_time = time.time()
                     # Reset state after reconnection
                     bg = {k:None for k in ROI}
                     base = {k:[] for k in ROI}
@@ -202,6 +205,7 @@ def detector(src, gui=True):
 
         in_grace = asc2_start is not None and now-asc2_start<ASC2_GRACE_PERIOD
         can_rb = not in_grace or ver_hot
+        reconnect_grace = last_reconnect_time is not None and now - last_reconnect_time < RECONNECT_GRACE_PERIOD
 
         # FSM
         if   state is S.IDLE and bot_hot and v<UP_FAST: state=S.ASC1
@@ -212,7 +216,7 @@ def detector(src, gui=True):
             state=S.ASC2; asc2_start=now; descent_seen=False
         elif state is S.ASC2 and descent_seen:
             pending_id=True; verify_dead=now+VERIFY_WINDOW; state=S.VERIFY; verify_hits=0
-        elif state is S.ASC2 and can_rb and bot_hot and v>DOWN_FAST and not descent_seen:
+        elif state is S.ASC2 and can_rb and bot_hot and v>DOWN_FAST and not descent_seen and not reconnect_grace:
             log_event(conn,"rollback",now); state=S.IDLE
         elif state is S.ASC2 and now-asc2_start>=AUTO_SUCCESS:
             log_event(conn,"success",now); state=S.IDLE
@@ -220,10 +224,14 @@ def detector(src, gui=True):
             if bot_hot and v>ROLLBACK_VELOCITY_THRESHOLD: verify_hits+=1
             elif ver_hot and v>VERIFY_ROLLBACK_VELOCITY:  verify_hits+=1
             else: verify_hits=max(0,verify_hits-1)
-            if verify_hits>=ROLLBACK_CONFIRM_FRAMES:
+            if verify_hits>=ROLLBACK_CONFIRM_FRAMES and not reconnect_grace:
                 log_event(conn,"rollback",now); state=S.IDLE
             elif now>=verify_dead:
                 log_event(conn,"success",now); state=S.IDLE
+        
+        # Reconnection grace: any top hit = success
+        if reconnect_grace and top_hot and state != S.IDLE:
+            log_event(conn,"success",now); state=S.IDLE
 
         # reset on idle
         if state is S.IDLE:
