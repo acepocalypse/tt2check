@@ -32,7 +32,7 @@ ROLLBACK_VELOCITY_THRESHOLD = 1.5
 VERIFY_ROLLBACK_VELOCITY = 2.0
 UP_FAST, DOWN_FAST = -0.6, 0.6
 VELOCITY_SMOOTHING = 7
-RECONNECT_GRACE_PERIOD = 20.0
+RECONNECT_GRACE_PERIOD = 30.0
 LIVE_URL = "https://cs4.pixelcaster.com/live/cedar2.stream/playlist.m3u8"
 
 QUEUE_TIMES_URL   = "https://queue-times.com/parks/50/queue_times.json"
