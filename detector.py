@@ -117,6 +117,10 @@ def detector(src, gui=True):
     max_reconnect_attempts=10
     start_time = time.time()
     last_reconnect_time = None
+    
+    # Frame-based timing
+    frame_count = 0
+    stream_fps = 10.0 if live else fps
 
     while True:
         now = time.time()
@@ -135,7 +139,7 @@ def detector(src, gui=True):
                     cap, live, _ = open_source(src)
                     reconnect_attempts = 0
                     last_reconnect_time = time.time()
-                    # Reset state after reconnection
+                    # Reset state after reconnection but preserve start_time
                     bg = {k:None for k in ROI}
                     base = {k:[] for k in ROI}
                     thr = {k:math.inf for k in ROI}
@@ -145,19 +149,19 @@ def detector(src, gui=True):
                     asc2_start = descent_start = verify_dead = None
                     descent_seen = False
                     verify_hits = 0
-                    start_time = time.time()
                     print("Reconnected successfully, resetting detector state")
                 except Exception as e:
                     print(f"Reconnection failed: {e}")
                 continue
             break
+
+        frame_count += 1
+        frame_time = start_time + (frame_count / stream_fps)
         
-        # Reset reconnect counter on successful frame read
         if live and reconnect_attempts > 0:
             reconnect_attempts = 0
 
-        # Use relative time for better handling after reconnections
-        relative_time = now - start_time
+        relative_time = frame_time - start_time
 
         # queue API
         if live and now-last_queue_update>=QUEUE_UPDATE_INTERVAL:
@@ -184,6 +188,7 @@ def detector(src, gui=True):
                 elif "verify" in k: thr[k]=min(m+SIGMA_VERIFY*s, wv*hv*0.6)
                 else: thr[k]=m+SIGMA_BOT*s
             armed=True
+            print(f"\n[ARMED at t={relative_time:.2f}s]")
 
         bot_hot = armed and mot["bot_L"]>thr["bot_L"] and mot["bot_R"]>thr["bot_R"]
         top_hot = armed and (mot["top_high"]>thr["top_high"] or mot["top_low"]>thr["top_low"])
@@ -191,8 +196,8 @@ def detector(src, gui=True):
 
         # descent tracking
         if top_hot:
-            descent_start=now; descent_seen=True
-        elif descent_start and now-descent_start>1.0:
+            descent_start=frame_time; descent_seen=True
+        elif descent_start and frame_time-descent_start>1.0:
             descent_start=None; descent_seen=False
 
         # velocity
@@ -200,10 +205,10 @@ def detector(src, gui=True):
         diff=cv2.absdiff(frame[by:by+bh,bx:bx+bw],bg["bot_L"].astype("uint8"))
         _,mk=cv2.threshold(cv2.cvtColor(diff,cv2.COLOR_BGR2GRAY),40,255,cv2.THRESH_BINARY)
         cy=centroid(mk)
-        hist.append((cy,now) if cy is not None else (hist[-1][0],now) if hist else (None,now))
+        hist.append((cy,frame_time) if cy is not None else (hist[-1][0],frame_time) if hist else (None,frame_time))
         v=smooth_velocity(hist)
 
-        in_grace = asc2_start is not None and now-asc2_start<ASC2_GRACE_PERIOD
+        in_grace = asc2_start is not None and frame_time-asc2_start<ASC2_GRACE_PERIOD
         can_rb = not in_grace or ver_hot
         reconnect_grace = last_reconnect_time is not None and now - last_reconnect_time < RECONNECT_GRACE_PERIOD
 
@@ -211,29 +216,27 @@ def detector(src, gui=True):
         if   state is S.IDLE and bot_hot and v<UP_FAST: state=S.ASC1
         elif state is S.ASC1 and bot_hot and v>DOWN_FAST: state=S.RBACK_DECEL
         elif state is S.RBACK_DECEL and mot["bot_L"]<thr["bot_L"]*0.1 and mot["bot_R"]<thr["bot_R"]*0.1:
-            t_wait=now; state=S.WAIT
-        elif state is S.WAIT and bot_hot and v<UP_FAST and now-t_wait>0.5:
-            state=S.ASC2; asc2_start=now; descent_seen=False
+            t_wait=frame_time; state=S.WAIT
+        elif state is S.WAIT and bot_hot and v<UP_FAST and frame_time-t_wait>0.5:
+            state=S.ASC2; asc2_start=frame_time; descent_seen=False
         elif state is S.ASC2 and descent_seen:
-            pending_id=True; verify_dead=now+VERIFY_WINDOW; state=S.VERIFY; verify_hits=0
+            pending_id=True; verify_dead=frame_time+VERIFY_WINDOW; state=S.VERIFY; verify_hits=0
         elif state is S.ASC2 and can_rb and bot_hot and v>DOWN_FAST and not descent_seen and not reconnect_grace:
-            log_event(conn,"rollback",now); state=S.IDLE
-        elif state is S.ASC2 and now-asc2_start>=AUTO_SUCCESS:
-            log_event(conn,"success",now); state=S.IDLE
+            log_event(conn,"rollback",frame_time); state=S.IDLE
+        elif state is S.ASC2 and frame_time-asc2_start>=AUTO_SUCCESS:
+            log_event(conn,"success",frame_time); state=S.IDLE
         elif state is S.VERIFY:
             if bot_hot and v>ROLLBACK_VELOCITY_THRESHOLD: verify_hits+=1
             elif ver_hot and v>VERIFY_ROLLBACK_VELOCITY:  verify_hits+=1
             else: verify_hits=max(0,verify_hits-1)
             if verify_hits>=ROLLBACK_CONFIRM_FRAMES and not reconnect_grace:
-                log_event(conn,"rollback",now); state=S.IDLE
-            elif now>=verify_dead:
-                log_event(conn,"success",now); state=S.IDLE
+                log_event(conn,"rollback",frame_time); state=S.IDLE
+            elif frame_time>=verify_dead:
+                log_event(conn,"success",frame_time); state=S.IDLE
         
-        # Reconnection grace: any top hit = success
         if reconnect_grace and top_hot and state != S.IDLE:
-            log_event(conn,"success",now); state=S.IDLE
+            log_event(conn,"success",frame_time); state=S.IDLE
 
-        # reset on idle
         if state is S.IDLE:
             asc2_start=descent_start=verify_dead=None
             descent_seen=False; verify_hits=0
@@ -257,7 +260,8 @@ def detector(src, gui=True):
             if cv2.waitKey(1)&0xFF==27: break
 
         print(f"\r{state.name:<8} B={'Y'if bot_hot else'-'} T={'Y'if top_hot else'-'} V={'Y'if ver_hot else'-'} "
-              f"v={v:5.2f} {'GR' if in_grace else '  '} t={relative_time:7.2f}",end='')
+              f"v={v:5.2f} {'GR' if in_grace else '  '} t={relative_time:7.2f} "
+              f"{'ARMED' if armed else f'base:{min(len(v) for v in base.values())}/{BASE_FRAMES}'}",end='')
 
     cap.release(); conn.close()
     if gui: cv2.destroyAllWindows(); print("\n[bye]")
