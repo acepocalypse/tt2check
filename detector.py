@@ -22,17 +22,17 @@ ROI = {
 
 # ─────────────────── CONSTANTS ───────────────────
 BASE_FRAMES = 60
-SIGMA_BOT, SIGMA_TOP, SIGMA_VERIFY = 6, 4, 3
+SIGMA_BOT, SIGMA_TOP, SIGMA_VERIFY = 10, 8, 6
 ARM_DELAY = 3
-VERIFY_WINDOW = 5.0
-AUTO_SUCCESS = 15
-ASC2_GRACE_PERIOD = 2.0
-ROLLBACK_CONFIRM_FRAMES = 8
-ROLLBACK_VELOCITY_THRESHOLD = 1.5
-VERIFY_ROLLBACK_VELOCITY = 2.0
-UP_FAST, DOWN_FAST = -0.6, 0.6
-VELOCITY_SMOOTHING = 7
-RECONNECT_GRACE_PERIOD = 30.0
+VERIFY_WINDOW = 8.0
+AUTO_SUCCESS = 10
+ASC2_GRACE_PERIOD = 6.0
+ROLLBACK_CONFIRM_FRAMES = 25
+ROLLBACK_VELOCITY_THRESHOLD = 6.0
+VERIFY_ROLLBACK_VELOCITY = 7.0
+UP_FAST, DOWN_FAST = -1.0, 1.0
+VELOCITY_SMOOTHING = 12
+RECONNECT_GRACE_PERIOD = 60.0
 LIVE_URL = "https://cs4.pixelcaster.com/live/cedar2.stream/playlist.m3u8"
 
 QUEUE_TIMES_URL   = "https://queue-times.com/parks/50/queue_times.json"
@@ -112,13 +112,13 @@ def detector(src, gui=True):
     asc2_start=descent_start=verify_dead=None
     descent_seen=pending_id=False
     verify_hits=0
+    rollback_confirm_count=0
     last_queue_update=0; queue_data=None
     reconnect_attempts=0
     max_reconnect_attempts=10
     start_time = time.time()
     last_reconnect_time = None
     
-    # Frame-based timing
     frame_count = 0
     stream_fps = 10.0 if live else fps
 
@@ -179,14 +179,14 @@ def detector(src, gui=True):
             cv2.accumulateWeighted(sub.astype("float32"),bg[k],0.02)
             if len(base[k])<BASE_FRAMES: base[k].append(mot[k])
 
-        # thresholds
+        # ─── THRESHOLDS ───
         if not armed and all(len(v)>=BASE_FRAMES for v in base.values()) and relative_time>=ARM_DELAY:
             for k in ROI:
                 m=sum(base[k])/len(base[k])
                 s=(sum((v-m)**2 for v in base[k])/len(base[k]))**0.5
                 if "top" in k: thr[k]=m+SIGMA_TOP*s
                 elif "verify" in k: thr[k]=min(m+SIGMA_VERIFY*s, wv*hv*0.6)
-                else: thr[k]=m+SIGMA_BOT*s
+                else: thr[k]=m+SIGMA_BOT*s*1.2
             armed=True
             print(f"\n[ARMED at t={relative_time:.2f}s]")
 
@@ -212,34 +212,53 @@ def detector(src, gui=True):
         can_rb = not in_grace or ver_hot
         reconnect_grace = last_reconnect_time is not None and now - last_reconnect_time < RECONNECT_GRACE_PERIOD
 
-        # FSM
-        if   state is S.IDLE and bot_hot and v<UP_FAST: state=S.ASC1
-        elif state is S.ASC1 and bot_hot and v>DOWN_FAST: state=S.RBACK_DECEL
+        # ─── FSM ───
+        if   state is S.IDLE and bot_hot and v<UP_FAST: 
+            state=S.ASC1; rollback_confirm_count=0
+        elif state is S.ASC1 and bot_hot and v>DOWN_FAST: 
+            state=S.RBACK_DECEL; rollback_confirm_count=0
         elif state is S.RBACK_DECEL and mot["bot_L"]<thr["bot_L"]*0.1 and mot["bot_R"]<thr["bot_R"]*0.1:
-            t_wait=frame_time; state=S.WAIT
+            t_wait=frame_time; state=S.WAIT; rollback_confirm_count=0
         elif state is S.WAIT and bot_hot and v<UP_FAST and frame_time-t_wait>0.5:
-            state=S.ASC2; asc2_start=frame_time; descent_seen=False
+            state=S.ASC2; asc2_start=frame_time; descent_seen=False; rollback_confirm_count=0
         elif state is S.ASC2 and descent_seen:
-            pending_id=True; verify_dead=frame_time+VERIFY_WINDOW; state=S.VERIFY; verify_hits=0
-        elif state is S.ASC2 and can_rb and bot_hot and v>DOWN_FAST and not descent_seen and not reconnect_grace:
-            log_event(conn,"rollback",frame_time); state=S.IDLE
+            pending_id=True; verify_dead=frame_time+VERIFY_WINDOW; state=S.VERIFY; verify_hits=0; rollback_confirm_count=0
+        elif state is S.ASC2 and can_rb and bot_hot and v>DOWN_FAST*3.0 and not descent_seen and not reconnect_grace:
+            if v > 5.0:
+                rollback_confirm_count += 1
+            else:
+                rollback_confirm_count = max(0, rollback_confirm_count - 2)
+            if rollback_confirm_count >= 15:
+                log_event(conn,"rollback",frame_time); state=S.IDLE; rollback_confirm_count=0
         elif state is S.ASC2 and frame_time-asc2_start>=AUTO_SUCCESS:
-            log_event(conn,"success",frame_time); state=S.IDLE
+            log_event(conn,"success",frame_time); state=S.IDLE; rollback_confirm_count=0
         elif state is S.VERIFY:
-            if bot_hot and v>ROLLBACK_VELOCITY_THRESHOLD: verify_hits+=1
-            elif ver_hot and v>VERIFY_ROLLBACK_VELOCITY:  verify_hits+=1
-            else: verify_hits=max(0,verify_hits-1)
+            rollback_detected = False
+            if bot_hot and v>ROLLBACK_VELOCITY_THRESHOLD and v < 12.0:
+                verify_hits+=1; rollback_detected=True
+            elif ver_hot and v>VERIFY_ROLLBACK_VELOCITY and v < 15.0:
+                verify_hits+=2; rollback_detected=True
+
+            if not rollback_detected:
+                verify_hits=max(0,verify_hits-4)
+                
             if verify_hits>=ROLLBACK_CONFIRM_FRAMES and not reconnect_grace:
-                log_event(conn,"rollback",frame_time); state=S.IDLE
+                log_event(conn,"rollback",frame_time); state=S.IDLE; rollback_confirm_count=0
             elif frame_time>=verify_dead:
-                log_event(conn,"success",frame_time); state=S.IDLE
+                log_event(conn,"success",frame_time); state=S.IDLE; rollback_confirm_count=0
         
-        if reconnect_grace and top_hot and state != S.IDLE:
-            log_event(conn,"success",frame_time); state=S.IDLE
+        # Reset rollback counter if not in rollback-detecting states or if velocity is too extreme
+        if state not in [S.ASC2, S.VERIFY] or abs(v) > 20.0:
+            rollback_confirm_count = 0
+            
+        # More conservative reconnect grace handling - favor success
+        if reconnect_grace:
+            if top_hot or (state in [S.ASC2, S.VERIFY] and frame_time - last_reconnect_time > 5):
+                log_event(conn,"success",frame_time); state=S.IDLE; rollback_confirm_count=0
 
         if state is S.IDLE:
             asc2_start=descent_start=verify_dead=None
-            descent_seen=False; verify_hits=0
+            descent_seen=False; verify_hits=0; rollback_confirm_count=0
 
         # ─── GUI ───
         if gui:
@@ -250,7 +269,8 @@ def detector(src, gui=True):
                 cv2.rectangle(view,(x,y),(x+w,y+h),color,thick)
                 cv2.putText(view,tag,(x,y-6),cv2.FONT_HERSHEY_SIMPLEX,0.5,color,1,cv2.LINE_AA)
             lines=[f"State:{state.name}",
-                   f"v:{v:.2f}  grace:{'Y' if in_grace else 'N'}"]
+                   f"v:{v:.2f}  grace:{'Y' if in_grace else 'N'}",
+                   f"RC:{rollback_confirm_count}"]
             if queue_data:
                 lines.append(f"TT2:{'OPEN' if queue_data['is_open'] else 'CLOSED'} "
                              f"{queue_data['wait_time']}m")
@@ -260,13 +280,16 @@ def detector(src, gui=True):
             if cv2.waitKey(1)&0xFF==27: break
 
         print(f"\r{state.name:<8} B={'Y'if bot_hot else'-'} T={'Y'if top_hot else'-'} V={'Y'if ver_hot else'-'} "
-              f"v={v:5.2f} {'GR' if in_grace else '  '} t={relative_time:7.2f} "
+              f"v={v:5.2f} {'GR' if in_grace else '  '} RC:{rollback_confirm_count:2d} t={relative_time:7.2f} "
               f"{'ARMED' if armed else f'base:{min(len(v) for v in base.values())}/{BASE_FRAMES}'}",end='')
 
     cap.release(); conn.close()
     if gui: cv2.destroyAllWindows(); print("\n[bye]")
 
 if __name__=="__main__":
+    ap=argparse.ArgumentParser(description="TT2 detector")
+    ap.add_argument("--video"); ap.add_argument("--no-gui",action="store_true")
+    detector(ap.parse_args().video, gui=not ap.parse_args().no_gui)
     ap=argparse.ArgumentParser(description="TT2 detector")
     ap.add_argument("--video"); ap.add_argument("--no-gui",action="store_true")
     detector(ap.parse_args().video, gui=not ap.parse_args().no_gui)
