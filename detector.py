@@ -39,6 +39,7 @@ QUEUE_TIMES_URL   = "https://queue-times.com/parks/50/queue_times.json"
 TT2_RIDE_ID       = 3772
 QUEUE_UPDATE_INTERVAL = 300
 DB_PATH = pathlib.Path("events.db")
+MIN_EVENT_INTERVAL = 81.0
 
 # ─────────────────── UTILS ───────────────────
 def open_source(path):
@@ -64,8 +65,13 @@ def db():
     return c
 
 def log_event(c, result, t):
+    c.execute("SELECT MAX(ts) FROM launches WHERE outcome = ?", (result,))
+    last_ts = c.fetchone()[0]
+    if last_ts and t - last_ts < MIN_EVENT_INTERVAL:
+        return False
     c.execute("INSERT INTO launches VALUES(NULL, ?, ?)", (t, result))
     c.commit(); print(f"\n[{result.upper():8} @ {t:7.2f}s]")
+    return True
 
 def fetch_queue_times():
     try:
@@ -118,6 +124,7 @@ def detector(src, gui=True):
     max_reconnect_attempts=10
     start_time = time.time()
     last_reconnect_time = None
+    last_event_time = 0
     
     frame_count = 0
     stream_fps = 10.0 if live else fps
@@ -128,7 +135,7 @@ def detector(src, gui=True):
         if not ok:
             if live: 
                 reconnect_attempts += 1
-                backoff_time = min(30, 2 ** reconnect_attempts)  # Exponential backoff, max 30s
+                backoff_time = min(30, 2 ** reconnect_attempts)
                 print(f"\nStream disconnected, reconnecting in {backoff_time}s... (attempt {reconnect_attempts}/{max_reconnect_attempts})")
                 if reconnect_attempts > max_reconnect_attempts:
                     print("Max reconnection attempts reached, exiting")
@@ -138,8 +145,7 @@ def detector(src, gui=True):
                     cap.release()
                     cap, live, _ = open_source(src)
                     reconnect_attempts = 0
-                    last_reconnect_time = time.time()
-                    # Reset state after reconnection but preserve start_time
+                    last_reconnect_time = frame_count / stream_fps
                     bg = {k:None for k in ROI}
                     base = {k:[] for k in ROI}
                     thr = {k:math.inf for k in ROI}
@@ -156,12 +162,12 @@ def detector(src, gui=True):
             break
 
         frame_count += 1
-        frame_time = start_time + (frame_count / stream_fps)
+        frame_time = frame_count / stream_fps
         
         if live and reconnect_attempts > 0:
             reconnect_attempts = 0
 
-        relative_time = frame_time - start_time
+        relative_time = frame_time
 
         # queue API
         if live and now-last_queue_update>=QUEUE_UPDATE_INTERVAL:
@@ -210,7 +216,7 @@ def detector(src, gui=True):
 
         in_grace = asc2_start is not None and frame_time-asc2_start<ASC2_GRACE_PERIOD
         can_rb = not in_grace or ver_hot
-        reconnect_grace = last_reconnect_time is not None and now - last_reconnect_time < RECONNECT_GRACE_PERIOD
+        reconnect_grace = last_reconnect_time is not None and frame_time - last_reconnect_time < RECONNECT_GRACE_PERIOD
 
         # ─── FSM ───
         if   state is S.IDLE and bot_hot and v<UP_FAST: 
@@ -228,10 +234,15 @@ def detector(src, gui=True):
                 rollback_confirm_count += 1
             else:
                 rollback_confirm_count = max(0, rollback_confirm_count - 2)
-            if rollback_confirm_count >= 15:
-                log_event(conn,"rollback",frame_time); state=S.IDLE; rollback_confirm_count=0
+            if rollback_confirm_count >= 15 and frame_time - last_event_time >= MIN_EVENT_INTERVAL:
+                if log_event(conn,"rollback",frame_time): 
+                    last_event_time = frame_time
+                state=S.IDLE; rollback_confirm_count=0
         elif state is S.ASC2 and frame_time-asc2_start>=AUTO_SUCCESS:
-            log_event(conn,"success",frame_time); state=S.IDLE; rollback_confirm_count=0
+            if frame_time - last_event_time >= MIN_EVENT_INTERVAL:
+                if log_event(conn,"success",frame_time):
+                    last_event_time = frame_time
+            state=S.IDLE; rollback_confirm_count=0
         elif state is S.VERIFY:
             rollback_detected = False
             if bot_hot and v>ROLLBACK_VELOCITY_THRESHOLD and v < 12.0:
@@ -242,10 +253,15 @@ def detector(src, gui=True):
             if not rollback_detected:
                 verify_hits=max(0,verify_hits-4)
                 
-            if verify_hits>=ROLLBACK_CONFIRM_FRAMES and not reconnect_grace:
-                log_event(conn,"rollback",frame_time); state=S.IDLE; rollback_confirm_count=0
+            if verify_hits>=ROLLBACK_CONFIRM_FRAMES and not reconnect_grace and frame_time - last_event_time >= MIN_EVENT_INTERVAL:
+                if log_event(conn,"rollback",frame_time):
+                    last_event_time = frame_time
+                state=S.IDLE; rollback_confirm_count=0
             elif frame_time>=verify_dead:
-                log_event(conn,"success",frame_time); state=S.IDLE; rollback_confirm_count=0
+                if frame_time - last_event_time >= MIN_EVENT_INTERVAL:
+                    if log_event(conn,"success",frame_time):
+                        last_event_time = frame_time
+                state=S.IDLE; rollback_confirm_count=0
         
         # Reset rollback counter if not in rollback-detecting states or if velocity is too extreme
         if state not in [S.ASC2, S.VERIFY] or abs(v) > 20.0:
@@ -254,7 +270,10 @@ def detector(src, gui=True):
         # More conservative reconnect grace handling - favor success
         if reconnect_grace:
             if top_hot or (state in [S.ASC2, S.VERIFY] and frame_time - last_reconnect_time > 5):
-                log_event(conn,"success",frame_time); state=S.IDLE; rollback_confirm_count=0
+                if frame_time - last_event_time >= MIN_EVENT_INTERVAL:
+                    if log_event(conn,"success",frame_time):
+                        last_event_time = frame_time
+                state=S.IDLE; rollback_confirm_count=0
 
         if state is S.IDLE:
             asc2_start=descent_start=verify_dead=None
@@ -289,7 +308,5 @@ def detector(src, gui=True):
 if __name__=="__main__":
     ap=argparse.ArgumentParser(description="TT2 detector")
     ap.add_argument("--video"); ap.add_argument("--no-gui",action="store_true")
-    detector(ap.parse_args().video, gui=not ap.parse_args().no_gui)
-    ap=argparse.ArgumentParser(description="TT2 detector")
-    ap.add_argument("--video"); ap.add_argument("--no-gui",action="store_true")
-    detector(ap.parse_args().video, gui=not ap.parse_args().no_gui)
+    args = ap.parse_args()
+    detector(args.video, gui=not args.no_gui)
