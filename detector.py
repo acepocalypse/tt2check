@@ -65,11 +65,13 @@ def db():
     return c
 
 def log_event(c, result, t):
-    c.execute("SELECT MAX(ts) FROM launches WHERE outcome = ?", (result,))
-    last_ts = c.fetchone()[0]
-    if last_ts and t - last_ts < MIN_EVENT_INTERVAL:
+    cursor = c.cursor()
+    cursor.execute("SELECT MAX(ts) FROM launches WHERE outcome = ?", (result,))
+    row = cursor.fetchone()
+    last_ts = row[0] if row and row[0] else None
+    if last_ts and time.time() - last_ts < MIN_EVENT_INTERVAL:
         return False
-    c.execute("INSERT INTO launches VALUES(NULL, ?, ?)", (t, result))
+    cursor.execute("INSERT INTO launches VALUES(NULL, ?, ?)", (time.time(), result))
     c.commit(); print(f"\n[{result.upper():8} @ {t:7.2f}s]")
     return True
 
@@ -87,7 +89,8 @@ def fetch_queue_times():
     return None
 
 def log_queue_time(c, q, t):
-    c.execute("INSERT INTO queue_times VALUES(NULL, ?, ?, ?, ?)",
+    cursor = c.cursor()
+    cursor.execute("INSERT INTO queue_times VALUES(NULL, ?, ?, ?, ?)",
               (t, q["is_open"], q["wait_time"], q["last_updated"]))
     c.commit()
 
@@ -135,7 +138,7 @@ def detector(src, gui=True):
         if not ok:
             if live: 
                 reconnect_attempts += 1
-                backoff_time = min(30, 2 ** reconnect_attempts)
+                backoff_time = min(30, 2 ** min(reconnect_attempts, 5))
                 print(f"\nStream disconnected, reconnecting in {backoff_time}s... (attempt {reconnect_attempts}/{max_reconnect_attempts})")
                 if reconnect_attempts > max_reconnect_attempts:
                     print("Max reconnection attempts reached, exiting")
@@ -155,6 +158,7 @@ def detector(src, gui=True):
                     asc2_start = descent_start = verify_dead = None
                     descent_seen = False
                     verify_hits = 0
+                    rollback_confirm_count = 0
                     print("Reconnected successfully, resetting detector state")
                 except Exception as e:
                     print(f"Reconnection failed: {e}")
@@ -217,13 +221,14 @@ def detector(src, gui=True):
         in_grace = asc2_start is not None and frame_time-asc2_start<ASC2_GRACE_PERIOD
         can_rb = not in_grace or ver_hot
         reconnect_grace = last_reconnect_time is not None and frame_time - last_reconnect_time < RECONNECT_GRACE_PERIOD
+        stuck_in_rback = state is S.RBACK_DECEL and frame_time - getattr(detector, '_rback_start', frame_time) > 30
 
         # ─── FSM ───
         if   state is S.IDLE and bot_hot and v<UP_FAST: 
             state=S.ASC1; rollback_confirm_count=0
         elif state is S.ASC1 and bot_hot and v>DOWN_FAST: 
-            state=S.RBACK_DECEL; rollback_confirm_count=0
-        elif state is S.RBACK_DECEL and mot["bot_L"]<thr["bot_L"]*0.1 and mot["bot_R"]<thr["bot_R"]*0.1:
+            state=S.RBACK_DECEL; rollback_confirm_count=0; detector._rback_start = frame_time
+        elif state is S.RBACK_DECEL and (mot["bot_L"]<thr["bot_L"]*0.1 and mot["bot_R"]<thr["bot_R"]*0.1 or stuck_in_rback):
             t_wait=frame_time; state=S.WAIT; rollback_confirm_count=0
         elif state is S.WAIT and bot_hot and v<UP_FAST and frame_time-t_wait>0.5:
             state=S.ASC2; asc2_start=frame_time; descent_seen=False; rollback_confirm_count=0
