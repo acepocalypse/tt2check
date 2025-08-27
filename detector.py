@@ -124,7 +124,7 @@ def detector(src, gui=True):
     rollback_confirm_count=0
     last_queue_update=0; queue_data=None
     reconnect_attempts=0
-    max_reconnect_attempts=10
+    # max_reconnect_attempts removed for infinite reconnect
     start_time = time.time()
     last_reconnect_time = None
     last_event_time = 0
@@ -136,13 +136,10 @@ def detector(src, gui=True):
         now = time.time()
         ok, frame = cap.read()
         if not ok:
-            if live: 
+            if live:
                 reconnect_attempts += 1
                 backoff_time = min(30, 2 ** min(reconnect_attempts, 5))
-                print(f"\nStream disconnected, reconnecting in {backoff_time}s... (attempt {reconnect_attempts}/{max_reconnect_attempts})")
-                if reconnect_attempts > max_reconnect_attempts:
-                    print("Max reconnection attempts reached, exiting")
-                    break
+                print(f"\nStream disconnected, reconnecting in {backoff_time}s... (attempt {reconnect_attempts})")
                 time.sleep(backoff_time)
                 try:
                     cap.release()
